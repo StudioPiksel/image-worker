@@ -1,21 +1,17 @@
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import Response, JSONResponse
 from rembg import remove
 from PIL import Image, ImageFilter, ImageOps
 import io
 import os
-import uvicorn
 
 app = FastAPI()
 
 API_KEY = os.getenv("API_KEY", "").strip()  # optional
 
-
 def _ensure_key(x_api_key: str | None):
-    if API_KEY:
-        if not x_api_key or x_api_key.strip() != API_KEY:
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
+    if API_KEY and (not x_api_key or x_api_key.strip() != API_KEY):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 def _open_image(data: bytes) -> Image.Image:
     try:
@@ -25,17 +21,13 @@ def _open_image(data: bytes) -> Image.Image:
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image file")
 
-
 def _remove_bg_to_rgba(im: Image.Image) -> Image.Image:
     buf = io.BytesIO()
     im.convert("RGBA").save(buf, format="PNG")
     out = remove(buf.getvalue())
     return Image.open(io.BytesIO(out)).convert("RGBA")
 
-
-def _add_white_bg_with_padding(
-    fg_rgba: Image.Image, target_size: int, pad_ratio: float
-) -> Image.Image:
+def _add_white_bg_with_padding(fg_rgba: Image.Image, target_size: int, pad_ratio: float) -> Image.Image:
     canvas = Image.new("RGBA", (target_size, target_size), (255, 255, 255, 255))
 
     inner = int(target_size * (1.0 - pad_ratio))
@@ -53,12 +45,8 @@ def _add_white_bg_with_padding(
     canvas.alpha_composite(fg, (x, y))
     return canvas
 
-
-def _add_soft_shadow(
-    bg_rgba: Image.Image, shadow_offset=(18, 18), blur=22, opacity=90
-) -> Image.Image:
+def _add_soft_shadow(bg_rgba: Image.Image, shadow_offset=(18, 18), blur=22, opacity=90) -> Image.Image:
     alpha = bg_rgba.split()[-1]
-
     shadow_mask = alpha.point(lambda p: min(255, int(p * (opacity / 255.0))))
     black = Image.new("RGBA", bg_rgba.size, (0, 0, 0, 255))
 
@@ -71,20 +59,15 @@ def _add_soft_shadow(
     out.alpha_composite(bg_rgba, (0, 0))
     return out
 
-
-# --- health + root (Render expects these to return 200 OK) ---
-
-@app.get("/")
+# Bitno: Render često radi HEAD provjere — ovako izbjegneš 405 spam.
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
-    return {"ok": True, "service": "image-worker"}
+    return JSONResponse({"ok": True, "service": "image-worker"})
 
-
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
+@app.api_route("/healthz", methods=["GET", "HEAD"])
 def health():
-    return {"status": "ok"}
-
-
-# --- main endpoint ---
+    return JSONResponse({"status": "ok"})
 
 @app.post("/process")
 async def process(
@@ -107,15 +90,7 @@ async def process(
     base = _add_white_bg_with_padding(fg, target_size=size, pad_ratio=pad)
     final_rgba = _add_soft_shadow(base)
 
-    final_rgb = final_rgba.convert("RGB")
     out = io.BytesIO()
-    final_rgb.save(out, format="JPEG", quality=92, optimize=True)
-    jpg_bytes = out.getvalue()
+    final_rgba.convert("RGB").save(out, format="JPEG", quality=92, optimize=True)
 
-    return Response(content=jpg_bytes, media_type="image/jpeg")
-
-
-# --- local run (Render uses Docker CMD, but this helps locally) ---
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("app:app", host="0.0.0.0", port=port)
+    return Response(content=out.getvalue(), media_type="image/jpeg")
