@@ -27,10 +27,9 @@ RUN pip install --no-cache-dir \
 
 COPY app.py /app/app.py
 
-# Prefetch model during build so it doesn't download on first request
-# (u2netp is smaller => faster and less RAM)
+# Prefetch model...
 RUN python -c "from rembg import new_session; new_session('u2netp'); print('u2netp cached')"
 
-EXPOSE 10000
+EXPOSE 10000   # ovo je opcionalno, Render ga ignoriše ako koristi $PORT
 
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000} --workers 1"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "${PORT}", "--workers", "1"]
