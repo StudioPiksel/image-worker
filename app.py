@@ -1,96 +1,130 @@
-from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
-from fastapi.responses import Response, JSONResponse
-from rembg import remove
-from PIL import Image, ImageFilter, ImageOps
-import io
 import os
+from io import BytesIO
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
+from fastapi.responses import Response
+from PIL import Image
+from rembg import remove, new_session
+
+# ---- perf/memory knobs (dobro za Render) ----
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+API_KEY = os.getenv("API_KEY", "").strip()
+
+# Manji model od u2net -> manje RAM-a
+MODEL_NAME = os.getenv("REMBG_MODEL", "u2netp")
+
+# Session se pravi jednom (kritično!)
+RMBG_SESSION = new_session(MODEL_NAME)
 
 app = FastAPI()
 
-API_KEY = os.getenv("API_KEY", "").strip()  # optional
 
-def _ensure_key(x_api_key: str | None):
-    if API_KEY and (not x_api_key or x_api_key.strip() != API_KEY):
+def _auth(x_api_key: str | None):
+    if not API_KEY:
+        return  # ako ne želiš auth, ostavi API_KEY prazno u Render env
+    if not x_api_key or x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-def _open_image(data: bytes) -> Image.Image:
-    try:
-        im = Image.open(io.BytesIO(data))
-        im.load()
-        return im
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid image file")
 
-def _remove_bg_to_rgba(im: Image.Image) -> Image.Image:
-    buf = io.BytesIO()
-    im.convert("RGBA").save(buf, format="PNG")
-    out = remove(buf.getvalue())
-    return Image.open(io.BytesIO(out)).convert("RGBA")
+def _resize_max_width(img: Image.Image, max_w: int) -> Image.Image:
+    if max_w <= 0:
+        return img
+    w, h = img.size
+    if w <= max_w:
+        return img
+    new_h = int(h * (max_w / w))
+    return img.resize((max_w, new_h), Image.LANCZOS)
 
-def _add_white_bg_with_padding(fg_rgba: Image.Image, target_size: int, pad_ratio: float) -> Image.Image:
-    canvas = Image.new("RGBA", (target_size, target_size), (255, 255, 255, 255))
 
-    inner = int(target_size * (1.0 - pad_ratio))
-    inner = max(64, inner)
+def _alpha_bbox(rgba: Image.Image):
+    """bbox of non-transparent pixels"""
+    alpha = rgba.split()[-1]
+    return alpha.getbbox()  # returns (left, upper, right, lower) or None
 
-    fg = fg_rgba.copy()
-    bbox = fg.getbbox()
-    if bbox:
-        fg = fg.crop(bbox)
 
-    fg = ImageOps.contain(fg, (inner, inner))
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok", "model": MODEL_NAME}
 
-    x = (target_size - fg.width) // 2
-    y = (target_size - fg.height) // 2
-    canvas.alpha_composite(fg, (x, y))
-    return canvas
-
-def _add_soft_shadow(bg_rgba: Image.Image, shadow_offset=(18, 18), blur=22, opacity=90) -> Image.Image:
-    alpha = bg_rgba.split()[-1]
-    shadow_mask = alpha.point(lambda p: min(255, int(p * (opacity / 255.0))))
-    black = Image.new("RGBA", bg_rgba.size, (0, 0, 0, 255))
-
-    shadow = Image.new("RGBA", bg_rgba.size, (0, 0, 0, 0))
-    shadow.alpha_composite(black, (0, 0), shadow_mask)
-    shadow = shadow.filter(ImageFilter.GaussianBlur(blur))
-
-    out = Image.new("RGBA", bg_rgba.size, (255, 255, 255, 255))
-    out.alpha_composite(shadow, shadow_offset)
-    out.alpha_composite(bg_rgba, (0, 0))
-    return out
-
-# Bitno: Render često radi HEAD provjere — ovako izbjegneš 405 spam.
-@app.api_route("/", methods=["GET", "HEAD"])
-def root():
-    return JSONResponse({"ok": True, "service": "image-worker"})
-
-@app.api_route("/health", methods=["GET", "HEAD"])
-@app.api_route("/healthz", methods=["GET", "HEAD"])
-def health():
-    return JSONResponse({"status": "ok"})
 
 @app.post("/process")
 async def process(
     file: UploadFile = File(...),
-    size: int = Form(1400),
-    pad: float = Form(0.30),
+    size: int = Form(1400),          # max width
+    pad: float = Form(0.30),         # whitespace padding fraction (0.30 = 30%)
+    out: str = Form("jpg"),          # "jpg" ili "png"
+    quality: int = Form(88),         # jpg quality
     x_api_key: str | None = Header(default=None),
 ):
-    _ensure_key(x_api_key)
+    _auth(x_api_key)
 
-    if size < 256 or size > 3000:
-        raise HTTPException(status_code=400, detail="Invalid size")
-    if pad < 0.0 or pad > 0.6:
-        raise HTTPException(status_code=400, detail="Invalid pad ratio")
+    # 1) read upload
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty file")
 
-    data = await file.read()
-    im = _open_image(data)
-    fg = _remove_bg_to_rgba(im)
+    # 2) open + normalize
+    try:
+        img = Image.open(BytesIO(raw))
+        img = img.convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image")
 
-    base = _add_white_bg_with_padding(fg, target_size=size, pad_ratio=pad)
-    final_rgba = _add_soft_shadow(base)
+    # 3) resize BEFORE rembg (ogroman RAM win)
+    img = _resize_max_width(img, size)
 
-    out = io.BytesIO()
-    final_rgba.convert("RGB").save(out, format="JPEG", quality=92, optimize=True)
+    # 4) remove bg (returns bytes)
+    input_buf = BytesIO()
+    img.save(input_buf, format="JPEG", quality=92)
+    input_bytes = input_buf.getvalue()
 
-    return Response(content=out.getvalue(), media_type="image/jpeg")
+    try:
+        out_bytes = remove(input_bytes, session=RMBG_SESSION)  # PNG bytes with alpha
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"rembg failed: {e}")
+
+    rgba = Image.open(BytesIO(out_bytes)).convert("RGBA")
+
+    # 5) crop to object bbox
+    bbox = _alpha_bbox(rgba)
+    if bbox:
+        rgba = rgba.crop(bbox)
+
+    # 6) add padding (white background)
+    pad = max(0.0, min(float(pad), 1.0))
+    ow, oh = rgba.size
+    pad_px = int(max(ow, oh) * pad)
+
+    cw = ow + 2 * pad_px
+    ch = oh + 2 * pad_px
+    canvas = Image.new("RGBA", (cw, ch), (255, 255, 255, 255))
+    canvas.alpha_composite(rgba, (pad_px, pad_px))
+
+    # 7) final resize to max width = size (after padding)
+    canvas = _resize_max_width(canvas, size)
+
+    # 8) export
+    out = (out or "jpg").lower().strip()
+    output = BytesIO()
+
+    if out in ("png",):
+        canvas.save(output, format="PNG", optimize=True)
+        media_type = "image/png"
+        filename = os.path.splitext(file.filename or "image")[0] + ".png"
+    else:
+        # flatten to RGB for JPG
+        rgb = Image.new("RGB", canvas.size, (255, 255, 255))
+        rgb.paste(canvas, mask=canvas.split()[-1])
+        q = max(60, min(int(quality), 95))
+        rgb.save(output, format="JPEG", quality=q, optimize=True, progressive=True)
+        media_type = "image/jpeg"
+        filename = os.path.splitext(file.filename or "image")[0] + ".jpg"
+
+    return Response(
+        content=output.getvalue(),
+        media_type=media_type,
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
