@@ -26,9 +26,8 @@ RUN pip install --no-cache-dir \
 
 COPY app.py /app/app.py
 
-# Prefetch model during build (u2netp - manji model za manje RAM-a)
+# Prefetch model during build (ostaje isto)
 RUN python -c "from rembg import new_session; new_session('u2netp'); print('u2netp cached')"
 
-# Render koristi $PORT env var (default 10000) - ne treba EXPOSE
-# CMD binduje na 0.0.0.0 i koristi $PORT direktno (bez fallback-a za sigurnost)
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "${PORT}", "--workers", "1"]
+# Koristi shell form za CMD da bi $PORT radio ispravno (Render setuje $PORT na 10000 default)
+CMD sh -c "uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1"
