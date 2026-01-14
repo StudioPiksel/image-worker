@@ -4,6 +4,7 @@ from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 from fastapi.responses import Response
 from PIL import Image
 from rembg import remove, new_session
+import psutil
 
 # ---- perf/memory knobs (dobro za Render) ----
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -53,38 +54,45 @@ def healthz():
 @app.post("/process")
 async def process(
     file: UploadFile = File(...),
-    size: int = Form(1400),          # max width
-    pad: float = Form(0.30),         # whitespace padding fraction (0.30 = 30%)
-    out: str = Form("jpg"),          # "jpg" ili "png"
-    quality: int = Form(88),         # jpg quality
+    size: int = Form(1400),
+    pad: float = Form(0.30),
+    out: str = Form("jpg"),
+    quality: int = Form(88),
     x_api_key: str | None = Header(default=None),
 ):
     _auth(x_api_key)
+
+    print("Memory before reading file:", psutil.Process().memory_info().rss // 1024**2, "MB")
 
     # 1) read upload
     raw = await file.read()
     if not raw:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    # 2) open + normalize
+    print("Memory after reading file:", psutil.Process().memory_info().rss // 1024**2, "MB")
+
     try:
         img = Image.open(BytesIO(raw))
         img = img.convert("RGB")
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image")
 
-    # 3) resize BEFORE rembg (ogroman RAM win)
+    print("Memory before rembg:", psutil.Process().memory_info().rss // 1024**2, "MB")
+
+    # 3) resize BEFORE rembg
     img = _resize_max_width(img, size)
 
-    # 4) remove bg (returns bytes)
+    # 4) remove bg
     input_buf = BytesIO()
     img.save(input_buf, format="JPEG", quality=92)
     input_bytes = input_buf.getvalue()
 
     try:
-        out_bytes = remove(input_bytes, session=RMBG_SESSION)  # PNG bytes with alpha
+        out_bytes = remove(input_bytes, session=RMBG_SESSION)  # ← samo ovdje jednom!
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"rembg failed: {e}")
+
+    print("Memory after rembg:", psutil.Process().memory_info().rss // 1024**2, "MB")
 
     rgba = Image.open(BytesIO(out_bytes)).convert("RGBA")
 
@@ -97,7 +105,6 @@ async def process(
     pad = max(0.0, min(float(pad), 1.0))
     ow, oh = rgba.size
     pad_px = int(max(ow, oh) * pad)
-
     cw = ow + 2 * pad_px
     ch = oh + 2 * pad_px
     canvas = Image.new("RGBA", (cw, ch), (255, 255, 255, 255))
@@ -109,7 +116,6 @@ async def process(
     # 8) export
     out = (out or "jpg").lower().strip()
     output = BytesIO()
-
     if out in ("png",):
         canvas.save(output, format="PNG", optimize=True)
         media_type = "image/png"
